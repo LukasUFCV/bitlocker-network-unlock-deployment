@@ -31,6 +31,11 @@ param(
     [switch]$CleanupSensitiveFiles,      # supprime PFX après import
     [string]$OutputDir = "C:\UFCV\BitLockerNetworkUnlock",
 
+    # ---- AD CS (optionnel, pour remplacer l'auto-signé) ----
+    [switch]$UseAdcs,
+    [string]$CaConfig = "",              # ex: "CA01\UFCV-CA"
+    [string]$TemplateName = "BitLocker Network Unlock",
+
     # ---- Safety ----
     [switch]$Force
 )
@@ -127,6 +132,80 @@ function Create-SelfSignedNetworkUnlockCert([string]$Fqdn) {
             "2.5.29.37={text}1.3.6.1.4.1.311.67.1.1"
         )
     Write-OK ("Cert créé : Thumbprint=" + $cert.Thumbprint)
+    return $cert
+}
+
+function Request-NetworkUnlockCertFromAdcs {
+    param(
+        [Parameter(Mandatory=$true)][string]$Fqdn,
+        [Parameter(Mandatory=$true)][string]$Subject,
+        [Parameter(Mandatory=$true)][string]$TemplateName,
+        [Parameter(Mandatory=$true)][string]$CaConfig,
+        [Parameter(Mandatory=$true)][string]$OutDir
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CaConfig)) {
+        throw "CaConfig est vide. Exemple attendu: `"CA01\UFCV-CA`". Pour lister les CAs: certutil -config - -ping"
+    }
+
+    Ensure-Dir $OutDir
+
+    $stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+    $infPath = Join-Path $OutDir "nu_$stamp.inf"
+    $reqPath = Join-Path $OutDir "nu_$stamp.req"
+    $cerPath = Join-Path $OutDir "nu_$stamp.cer"
+
+    # INF certreq (Machine cert) + SAN DNS
+    $inf = @"
+[Version]
+Signature="$Windows NT$"
+
+[NewRequest]
+Subject = "$Subject"
+KeySpec = 1
+KeyLength = 2048
+HashAlgorithm = sha512
+Exportable = TRUE
+MachineKeySet = TRUE
+ProviderName = "Microsoft Software Key Storage Provider"
+RequestType = PKCS10
+KeyUsage = 0xa0
+
+[Extensions]
+2.5.29.17 = "{text}dns=$Fqdn"
+
+[RequestAttributes]
+CertificateTemplate = $TemplateName
+"@
+
+    Write-Step "AD CS: génération requête certreq (.inf/.req)"
+    $inf | Out-File -FilePath $infPath -Encoding ASCII -Force
+
+    $p1 = Start-Process -FilePath "certreq.exe" -ArgumentList @("-new", $infPath, $reqPath) -Wait -PassThru -NoNewWindow
+    if ($p1.ExitCode -ne 0) { throw "certreq -new a échoué (ExitCode=$($p1.ExitCode))." }
+    Write-OK "Requête générée: $reqPath"
+
+    Write-Step "AD CS: soumission à la CA ($CaConfig) + récupération du .cer"
+    $p2 = Start-Process -FilePath "certreq.exe" -ArgumentList @("-submit","-config",$CaConfig,$reqPath,$cerPath) -Wait -PassThru -NoNewWindow
+    if ($p2.ExitCode -ne 0) { throw "certreq -submit a échoué (ExitCode=$($p2.ExitCode))." }
+    Write-OK "Cert reçu: $cerPath"
+
+    Write-Step "AD CS: accept (installation dans LocalMachine\My)"
+    $p3 = Start-Process -FilePath "certreq.exe" -ArgumentList @("-accept",$cerPath) -Wait -PassThru -NoNewWindow
+    if ($p3.ExitCode -ne 0) { throw "certreq -accept a échoué (ExitCode=$($p3.ExitCode))." }
+    Write-OK "Cert installé dans Cert:\LocalMachine\My"
+
+    # Récupère le cert fraîchement installé
+    $cert = Get-ChildItem -Path "Cert:\LocalMachine\My" |
+        Where-Object { $_.Subject -eq $Subject } |
+        Sort-Object NotBefore -Descending |
+        Select-Object -First 1
+
+    if (-not $cert) {
+        throw "Cert introuvable dans LocalMachine\\My après accept. Vérifie template/enroll droits."
+    }
+
+    Write-OK ("Cert AD CS OK : Thumbprint=" + $cert.Thumbprint)
     return $cert
 }
 
@@ -295,7 +374,6 @@ try {
             throw "Module ServerManager introuvable. Ce script est prévu pour Windows Server (Get/Install-WindowsFeature)."
         }
 
-        # D’après Microsoft: WDS + BitLocker-NetworkUnlock :contentReference[oaicite:4]{index=4}
         Ensure-WindowsFeature "WDS-Deployment"
         Ensure-WindowsFeature "WDS-Transport"
         Ensure-WindowsFeature "BitLocker-NetworkUnlock"
@@ -322,15 +400,26 @@ try {
         Write-Info "FQDN serveur : $fqdn"
 
         $existing = Find-ExistingNetworkUnlockCert
+
         if ($existing -and -not $RotateCertificate) {
-            Write-Warn "Cert existant détecté (LocalMachine\\My) : $($existing.Thumbprint)"
-            Write-Info "Rotation désactivée -> on réutilise ce cert. (Ajoute -RotateCertificate pour en créer un nouveau.)"
+            Write-Warn "Cert existant détecté (LocalMachine\My) : $($existing.Thumbprint)"
+            Write-Info "Rotation désactivée -> réutilisation."
             $cert = $existing
-        } else {
-            if ($existing -and $RotateCertificate) {
-                Write-Warn "Rotation activée : un nouveau cert va être créé (l’ancien reste dans My, tu peux le nettoyer ensuite)."
+        }
+        else {
+            if ($UseAdcs) {
+                Write-Info "Mode AD CS activé -> demande d'un certificat via template: $TemplateName"
+                $cert = Request-NetworkUnlockCertFromAdcs `
+                    -Fqdn $fqdn `
+                    -Subject $CertSubject `
+                    -TemplateName $TemplateName `
+                    -CaConfig $CaConfig `
+                    -OutDir $OutputDir
             }
-            $cert = Create-SelfSignedNetworkUnlockCert -Fqdn $fqdn
+            else {
+                Write-Info "Mode auto-signé (par défaut)"
+                $cert = Create-SelfSignedNetworkUnlockCert -Fqdn $fqdn
+            }
         }
 
         $export = Export-NetworkUnlockCert -Cert $cert -OutDir $OutputDir
@@ -338,7 +427,7 @@ try {
         Import-PfxToFVENKP -PfxPath $export.PfxPath -PfxPasswordPlain $export.PfxPasswordPlain
         Restart-WdsIfPresent
 
-        # Optionnel: bde-network-unlock.ini pour subnets :contentReference[oaicite:5]{index=5}
+        # Optionnel: bde-network-unlock.ini pour subnets
         Write-Title "3) Subnet policy (optionnel)"
         $thumb = ($cert.Thumbprint -replace "\s","")
         Write-SubnetPolicyIni -ThumbprintNoSpaces $thumb -Subnets $AllowedSubnets
@@ -355,7 +444,7 @@ try {
         if (-not $CleanupSensitiveFiles) {
             Write-Warn "PFX conservé (.pfx) : $($export.PfxPath)  (contient clé privée)"
         }
-        Write-Info "À importer dans GPMC: Computer Configuration > Policies > Windows Settings > Security Settings > Public Key Policies > BitLocker Drive Encryption Network Unlock Certificate :contentReference[oaicite:6]{index=6}"
+        Write-Info "À importer dans GPMC: Computer Configuration > Policies > Windows Settings > Security Settings > Public Key Policies > BitLocker Drive Encryption Network Unlock Certificate"
     }
 
     if ($Mode -in @("All","GpoOnly")) {
@@ -407,18 +496,18 @@ try {
 
         Write-Title "6) IMPORTANT — Déploiement du .CER (étape GPMC)"
         Write-Warn "Le script ne peut pas injecter proprement à 100% la cert dans 'Public Key Policies' via un cmdlet natif."
-        Write-Info "Fais-le en 30 secondes dans GPMC (Microsoft):"
+        Write-Info "Fais-le en 30 secondes dans GPMC :"
         Write-Host "  1) Ouvre gpmc.msc" -ForegroundColor Gray
         Write-Host "  2) Édite le GPO: $GpoName" -ForegroundColor Gray
         Write-Host "  3) Va à: Computer Configuration > Policies > Windows Settings > Security Settings > Public Key Policies > BitLocker Drive Encryption Network Unlock Certificate" -ForegroundColor Gray
         Write-Host "  4) Right-click > Add Network Unlock Certificate > importe BitLocker-NetworkUnlock.cer" -ForegroundColor Gray
-        Write-Info "Côté client, tu pourras voir la cert sous HKLM\\Software\\Policies\\Microsoft\\SystemCertificates\\FVE_NKP :contentReference[oaicite:7]{index=7}"
-        Write-Info "Et valider la présence du protector Network Unlock via: manage-bde -protectors -get C: (protector '9') :contentReference[oaicite:8]{index=8}"
+        Write-Info "Côté client, tu pourras voir la cert sous HKLM\Software\Policies\Microsoft\SystemCertificates\FVE_NKP"
+        Write-Info "Et valider la présence du protector Network Unlock via: manage-bde -protectors -get C: (protector '9')"
     }
 
     Write-Title "✅ Terminé"
     Write-OK "Déploiement terminé. Log complet: $logPath"
-    Write-Info "Pense à: gpupdate /force + reboot des clients après déploiement GPO/cert (requis côté Network Unlock). :contentReference[oaicite:9]{index=9}"
+    Write-Info "Pense à: gpupdate /force + reboot des clients après déploiement GPO/cert (requis côté Network Unlock)."
 }
 catch {
     Write-Title "💥 Erreur"

@@ -295,4 +295,7 @@ BitLocker Network Unlock Certificate → Add certificate
 
 ## 📄 License
 
-MIT License (recommended for reuse)
+This repository is intended for internal professional use within an organizational context.
+
+All rights reserved.
+Unauthorized use, reproduction, modification, or distribution outside the company or authorized scope is prohibited without prior permission.
